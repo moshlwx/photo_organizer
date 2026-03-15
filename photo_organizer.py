@@ -25,11 +25,38 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, asdict
+
 from enum import Enum
 import time
 import signal
 import atexit
 import random
+
+# 元数据读取库
+try:
+    import piexif
+    PIEXIF_AVAILABLE = True
+except ImportError:
+    PIEXIF_AVAILABLE = False
+
+try:
+    from pymediainfo import MediaInfo
+    MEDIAINFO_AVAILABLE = True
+except ImportError:
+    MEDIAINFO_AVAILABLE = False
+
+# 检测是否包含中文字符
+def contains_chinese(text: str) -> bool:
+    """
+    检测文本是否包含中文字符
+
+    Args:
+        text: 要检测的文本
+
+    Returns:
+        是否包含中文字符
+    """
+    return any('\u4e00' <= char <= '\u9fff' for char in text)
 
 # 支持的图片格式
 SUPPORTED_IMAGE_FORMATS = {
@@ -56,6 +83,7 @@ STATUS_FILE = 'organizer_status.json'
 LOG_FILE = 'photo_organizer.log'
 DUPLICATE_HASHES_FILE = 'duplicate_hashes.json'
 SCAN_RESULTS_FILE = 'scan_results.json'
+RENAMING_INDEX_FILE = 'renaming_index.json'
 
 # 默认批次配置
 DEFAULT_BATCH_SIZE = 100
@@ -118,6 +146,9 @@ class PhotoOrganizer:
         self.duplicate_hashes: Set[str] = set()
         self.paused = False
         self.stop_requested = False
+
+        # 重命名索引（格式：YYYYMMDD -> 计数器）
+        self.renaming_index: Dict[str, int] = {}
 
         # 统计信息
         self.stats = {
@@ -427,6 +458,15 @@ class PhotoOrganizer:
             except Exception as e:
                 self.logger.error(f"加载哈希文件失败: {e}")
 
+        if index_path.exists():
+            try:
+                with open(index_path, 'r', encoding='utf-8') as f:
+                    self.renaming_index = json.load(f)
+                self.logger.info(f"加载了 {len(self.renaming_index)} 个日期重命名索引")
+                loaded = True
+            except Exception as e:
+                self.logger.error(f"加载重命名索引失败: {e}")
+
         return loaded
 
     def _save_status(self):
@@ -437,6 +477,7 @@ class PhotoOrganizer:
 
             status_path = log_dir / STATUS_FILE
             hash_path = log_dir / DUPLICATE_HASHES_FILE
+            index_path = log_dir / RENAMING_INDEX_FILE
 
             # 保存文件状态
             data = {key: asdict(value) for key, value in self.status_data.items()}
@@ -446,6 +487,10 @@ class PhotoOrganizer:
             # 保存哈希集合
             with open(hash_path, 'w', encoding='utf-8') as f:
                 json.dump(list(self.duplicate_hashes), f, ensure_ascii=False)
+
+            # 保存重命名索引
+            with open(index_path, 'w', encoding='utf-8') as f:
+                json.dump(self.renaming_index, f, ensure_ascii=False)
 
             self.logger.debug("状态已保存")
         except Exception as e:
@@ -556,10 +601,7 @@ class PhotoOrganizer:
 
     def _get_video_creation_date(self, file_path: Path) -> Optional[datetime]:
         """
-        获取视频的拍摄时间（通过文件修改时间）
-
-        注意：完整实现需要使用 pymediainfo 或 ffmpeg-python 等库
-        这里使用文件修改时间作为 fallback
+        获取视频的拍摄时间（通过 MediaInfo 读取元数据）
 
         Args:
             file_path: 视频文件路径
@@ -567,26 +609,118 @@ class PhotoOrganizer:
         Returns:
             视频的拍摄时间
         """
-        # TODO: 可以集成 pymediainfo 或 ffmpeg-python 来读取视频元数据
-        # 示例：
-        # from pymediainfo import MediaInfo
-        # mediainfo = MediaInfo(str(file_path))
-        # for track in mediainfo.tracks:
-        #     if track.track_type == 'Video':
-        #         if hasattr(track, 'encoded_date'):
-        #             return datetime.strptime(track.encoded_date, 'UTC %Y-%m-%d %H:%M:%S')
+        if not MEDIAINFO_AVAILABLE:
+            self.logger.warning(f"pymediainfo 未安装，无法读取视频元数据，使用文件修改时间: {file_path.name}")
+            try:
+                return datetime.fromtimestamp(file_path.stat().st_mtime)
+            except Exception:
+                return None
+
+        try:
+            media_info = MediaInfo.parse(str(file_path))
+
+            # 优先尝试获取 Track 的 Tagged_date 或 Encoded_date
+            for track in media_info.tracks:
+                if track.track_type == 'Video':
+                    # 尝试多种可能的日期字段
+                    for date_field in ['tagged_date', 'encoded_date', 'creation_date']:
+                        if hasattr(track, date_field):
+                            date_str = getattr(track, date_field)
+                            if date_str:
+                                # MediaInfo 返回的日期格式通常是: "UTC 2024-01-01 12:00:00"
+                                # 或 "2024-01-01 12:00:00"
+                                try:
+                                    # 尝试去除 "UTC " 前缀
+                                    if date_str.startswith('UTC '):
+                                        date_str = date_str[4:]
+
+                                    # 尝试解析不同格式
+                                    for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M:%S.%f']:
+                                        try:
+                                            return datetime.strptime(date_str, fmt)
+                                        except ValueError:
+                                            continue
+                                except Exception as e:
+                                    self.logger.debug(f"解析视频日期失败 {date_field}={date_str}: {e}")
+                                    continue
+
+            # 如果没有找到视频轨道的日期，尝试获取通用轨道的日期
+            for track in media_info.tracks:
+                if track.track_type == 'General':
+                    for date_field in ['tagged_date', 'encoded_date', 'file_creation_date', 'file_modified_date']:
+                        if hasattr(track, date_field):
+                            date_str = getattr(track, date_field)
+                            if date_str:
+                                try:
+                                    if date_str.startswith('UTC '):
+                                        date_str = date_str[4:]
+                                    return datetime.strptime(date_str[:19], '%Y-%m-%d %H:%M:%S')
+                                except Exception as e:
+                                    self.logger.debug(f"解析通用日期失败 {date_field}={date_str}: {e}")
+                                    continue
+
+        except Exception as e:
+            self.logger.warning(f"读取视频元数据失败 {file_path.name}: {e}")
 
         # Fallback: 使用文件修改时间
         try:
-            mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
-            return mod_time
+            return datetime.fromtimestamp(file_path.stat().st_mtime)
         except Exception as e:
             self.logger.error(f"获取视频时间失败 {file_path}: {e}")
             return None
 
+    def _get_image_exif_date(self, file_path: Path) -> Optional[datetime]:
+        """
+        从照片的 EXIF 数据中获取拍摄时间
+
+        Args:
+            file_path: 照片文件路径
+
+        Returns:
+            照片的拍摄时间，如果无法获取则返回 None
+        """
+        if not PIEXIF_AVAILABLE:
+            self.logger.debug(f"piexif 未安装，无法读取 EXIF: {file_path.name}")
+            return None
+
+        try:
+            # 读取 EXIF 数据
+            exif_dict = piexif.load(str(file_path))
+
+            # 尝试多种 EXIF 标签，按优先级顺序
+            exif_tags = [
+                'DateTimeOriginal',      # 原始拍摄时间（最准确）
+                'DateTimeDigitized',     # 数字化时间
+                'DateTime'               # 修改时间
+            ]
+
+            for tag in exif_tags:
+                try:
+                    # EXIF 的时间格式: "YYYY:MM:DD HH:MM:SS"
+                    date_str = exif_dict.get('Exif', {}).get(piexif.ExifIFD[tag])
+                    if date_str:
+                        # 将 "YYYY:MM:DD" 格式转换为 "YYYY-MM-DD"
+                        date_str = date_str.replace(':', '-', 2)
+                        return datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
+                except Exception as e:
+                    self.logger.debug(f"解析 EXIF {tag} 失败: {e}")
+                    continue
+
+        except Exception as e:
+            # 不是所有图片都有 EXIF，这是正常的
+            self.logger.debug(f"读取 EXIF 失败 {file_path.name}: {e}")
+
+        return None
+
     def _get_photo_date(self, file_path: Path) -> Optional[datetime]:
         """
         获取照片/视频的拍摄日期
+
+        优先级：
+        1. 文件名中的日期
+        2. 照片的 EXIF 拍摄时间
+        3. 视频的元数据时间
+        4. 文件修改时间（fallback）
 
         Args:
             file_path: 文件路径
@@ -594,17 +728,24 @@ class PhotoOrganizer:
         Returns:
             照片/视频的拍摄日期，如果无法获取则返回文件的修改时间
         """
-        # 首先尝试从文件名解析日期
+        ext = file_path.suffix.lower()
+
+        # 1. 首先尝试从文件名解析日期
         date_from_name = self._parse_date_from_filename(file_path)
         if date_from_name:
             return date_from_name
 
-        # 如果是视频文件，使用视频时间获取方法
-        ext = file_path.suffix.lower()
+        # 2. 如果是照片文件，尝试从 EXIF 读取
+        if ext in SUPPORTED_IMAGE_FORMATS:
+            exif_date = self._get_image_exif_date(file_path)
+            if exif_date:
+                return exif_date
+
+        # 3. 如果是视频文件，使用视频时间获取方法
         if ext in SUPPORTED_VIDEO_FORMATS:
             return self._get_video_creation_date(file_path)
 
-        # 尝试从文件修改时间获取
+        # 4. Fallback: 尝试从文件修改时间获取
         try:
             mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
             return mod_time
@@ -656,6 +797,52 @@ class PhotoOrganizer:
         year = photo_date.strftime('%Y')
         month = photo_date.strftime('%m')
         return self.target_dir / year / month
+
+    def _get_new_filename(self, file_path: Path, photo_date: datetime) -> str:
+        """
+        获取新文件名（仅对非中文文件名）
+
+        格式：IMG_YYYYMMDD_XXXX.ext 或 MOV_YYYYMMDD_XXXX.ext
+
+        Args:
+            file_path: 原始文件路径
+            photo_date: 照片/视频日期
+
+        Returns:
+            新文件名，如果原文件名包含中文则返回原文件名
+        """
+        original_name = file_path.stem
+        ext = file_path.suffix
+
+        # 如果文件名包含中文，保留原文件名
+        if contains_chinese(original_name):
+            return file_path.name
+
+        # 确定前缀
+        ext_lower = ext.lower()
+        if ext_lower in SUPPORTED_VIDEO_FORMATS:
+            prefix = 'MOV'
+        else:
+            prefix = 'IMG'
+
+        # 生成日期键（YYYYMMDD）
+        date_key = photo_date.strftime('%Y%m%d')
+
+        # 获取或初始化序号
+        if date_key not in self.renaming_index:
+            self.renaming_index[date_key] = 1
+
+        # 生成序号（4位数字）
+        sequence = self.renaming_index[date_key]
+        sequence_str = f"{sequence:04d}"
+
+        # 增加计数器
+        self.renaming_index[date_key] += 1
+
+        # 生成新文件名
+        new_name = f"{prefix}_{date_key}_{sequence_str}{ext}"
+
+        return new_name
 
     def _get_unique_filename(self, target_dir: Path, original_filename: str) -> str:
         """
@@ -923,36 +1110,39 @@ class PhotoOrganizer:
         # 获取目标目录
         target_dir = self._get_target_directory(photo_date)
 
-        # 为两个文件生成相同的目标文件名（保持配对）
-        photo_base_name = photo_file.stem
-        photo_ext = photo_file.suffix
-        video_ext = video_file.suffix
+        # 生成新的文件名对
+        # 先用照片文件获取新名称，然后提取序号部分给视频使用
+        new_photo_name = self._get_new_filename(photo_file, photo_date)
 
-        # 找到可用的文件名对
-        counter = 1
-        photo_target_filename = photo_file.name
-        video_target_filename = f"{photo_base_name}{video_ext}"
+        # 检查照片文件名是否包含中文（包含中文则保留原样）
+        if contains_chinese(photo_file.stem):
+            # 中文文件名，视频用相同的基础名
+            photo_base_name = photo_file.stem
+            video_target_filename = f"{photo_base_name}{video_file.suffix}"
+            photo_target_filename = new_photo_name
+        else:
+            # 英文文件名，生成配对的文件名
+            # 格式：IMG_YYYYMMDD_XXXX.heic 和 MOV_YYYYMMDD_XXXX.mov
+            date_key = photo_date.strftime('%Y%m%d')
 
-        # 检查是否存在
-        photo_target = target_dir / photo_target_filename
-        video_target = target_dir / video_target_filename
+            # 获取当前序号（之前加1了，这里减1）
+            sequence = self.renaming_index[date_key] - 1
+            sequence_str = f"{sequence:04d}"
 
-        while photo_target.exists() or video_target.exists():
-            photo_target_filename = f"{photo_base_name}_{counter}{photo_ext}"
-            video_target_filename = f"{photo_base_name}_{counter}{video_ext}"
-            photo_target = target_dir / photo_target_filename
-            video_target = target_dir / video_target_filename
-            counter += 1
+            photo_target_filename = f"IMG_{date_key}_{sequence_str}{photo_file.suffix}"
+            video_target_filename = f"MOV_{date_key}_{sequence_str}{video_file.suffix}"
 
         # 处理两个文件
         success = True
 
         # 处理照片
+        photo_target = target_dir / photo_target_filename
         if not self._process_single_file(photo_file, photo_target):
             self.logger.error(f"Live Photos 照片处理失败: {photo_file}")
             success = False
 
         # 处理视频
+        video_target = target_dir / video_target_filename
         if not self._process_single_file(video_file, video_target):
             self.logger.error(f"Live Photos 视频处理失败: {video_file}")
             success = False
@@ -1048,7 +1238,16 @@ class PhotoOrganizer:
 
             # 获取目标目录
             target_dir = self._get_target_directory(media_date)
-            target_filename = self._get_unique_filename(target_dir, file_path.name)
+
+            # 生成新文件名（英文名自动重命名，中文名保留）
+            new_filename = self._get_new_filename(file_path, media_date)
+
+            # 如果是中文文件名，仍然需要检查重名
+            if contains_chinese(file_path.stem):
+                target_filename = self._get_unique_filename(target_dir, new_filename)
+            else:
+                target_filename = new_filename
+
             target_path = target_dir / target_filename
 
             record.target_path = str(target_path)

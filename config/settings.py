@@ -4,7 +4,7 @@
 
 # 支持的图片格式
 SUPPORTED_IMAGE_FORMATS = {
-    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tiftif',
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
     '.webp', '.heic', '.heif', '.raw', '.cr2', '.nef', '.arw',
     '.dng', '.orf', '.rw2', '.pef', '.srw', '.x3f', '.3fr',
     '.mos', '.mrw', '.erf', '.k25', '.kdc'
@@ -20,7 +20,8 @@ SUPPORTED_VIDEO_FORMATS = {
 LIVE_PHOTO_VIDEO_FORMATS = {'.mov'}
 
 # 所有支持的媒体格式
-SUPPORTED_MEDIA_FORMATS = SUPPORTED_IMAGE_FORMATS | SUPPORTED_VIDEO_FORMATS
+SUPPORTED_MEDIA_FORMATS = SUPPORTED_IMAGE_FORMATS 
+# | SUPPORTED_VIDEO_FORMATS
 
 # 状态文件名
 STATUS_FILE = 'organizer_status.json'
@@ -30,8 +31,8 @@ RENAMING_INDEX_FILE = 'renaming_index.json'
 SCAN_RESULTS_FILE = 'scan_results.json'
 
 # 默认批次配置
-DEFAULT_BATCH_SIZE = 100
-DEFAULT_BATCH_INTERVAL = 5  # 秒
+DEFAULT_BATCH_SIZE = 1000
+DEFAULT_BATCH_INTERVAL = 2  # 秒
 MAX_RETRIES = 3
 
 # 哈希计算配置

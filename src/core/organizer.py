@@ -233,7 +233,7 @@ class PhotoOrganizer:
         return health_status
 
     @staticmethod
-    def _parse_date_from_filename(file_path: Path) -> Optional:
+    def _parse_date_from_filename(file_path: Path):
         """
         从文件名解析日期（静态方法）
 
@@ -295,7 +295,7 @@ class PhotoOrganizer:
         for file_path in media_files:
             try:
                 file_size = file_path.stat().st_size
-                total_size += file file_size
+                total_size += file_size
 
                 ext = file_path.suffix.lower()
                 format_counts[ext] = format_counts.get(ext, 0) + 1

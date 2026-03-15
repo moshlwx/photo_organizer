@@ -4,7 +4,7 @@
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Set
-import datetime
+from datetime import datetime as dt
 
 from src.models.file_record import FileRecord, FileProcessingStatus, ProcessingStats
 from src.utils.hash_utils import calculate_file_hash
@@ -42,20 +42,18 @@ class FileProcessor:
         self.logger = logging.getLogger('FileProcessor')
         self.stats = ProcessingStats()
 
-    def _get_photo_date(self, file_path: Path) -> Optional:
+    def _get_photo_date(self, file_path: Path) :
         """
         获取照片/视频的拍摄日期
 
         优先级：
         1. 文件名中的日期
         2. 照片的 EXIF 拍摄时间
-        3. 视频的元数据时间
+        3. 视频的元数据时间（或文件修改时间）
         4. 文件修改时间（fallback）
         """
-        from src.core.organizer import PhotoOrganizer  # 避免循环导入
-
-        # 首先尝试从文件名解析日期
-        date_from_name = PhotoOrganizer._parse_date_from_filename_static(file_path)
+        # 从文件名解析日期
+        date_from_name = self._parse_date_from_filename(file_path)
         if date_from_name:
             return date_from_name
 
@@ -67,17 +65,51 @@ class FileProcessor:
             if exif_date:
                 return exif_date
 
-        # 如果是视频文件，使用视频时间获取方法
+        # 如果是视频文件，使用文件修改时间（跳过元数据读取以提升性能）
         if ext in SUPPORTED_VIDEO_FORMATS:
-            return get_video_creation_date(file_path)
+            try:
+                return dt.fromtimestamp(file_path.stat().st_mtime)
+            except Exception as e:
+                self.logger.error(f"获取视频时间失败 {file_path}: {e}")
+                return None
 
         # Fallback: 尝试从文件修改时间获取
         try:
-            import datetime
-            return datetime.datetime.fromtimestamp(file_path.stat().st_mtime)
+            return dt.fromtimestamp(file_path.stat().st_mtime)
         except Exception as e:
             self.logger.error(f"获取文件时间失败 {file_path}: {e}")
             return None
+
+    def _parse_date_from_filename(self, file_path: Path):
+        """
+        从文件名解析日期
+
+        支持常见格式:
+        - IMG_20240101_120000.jpg
+        - 2024-01-01-12-00-00.jpg
+        - 20240101_120000.jpg
+        - DSC_20240101_120000.jpg
+        """
+        filename = file_path.stem
+
+        # 尝试多种日期格式
+        date_formats = [
+            '%Y%m%d_%H%M%S',      # 20240101_120000
+            '%Y-%m-%d-%H-%M-%S',   # 2024-01-01-12-00-00
+            '%Y%m%d',              # 20240101
+            '%Y-%m-%d',            # 2024-01-01
+        ]
+
+        # 处理带前缀的文件名 (如 IMG_2024011...)
+        parts = filename.split('_')
+        for part in parts:
+            for fmt in date_formats:
+                try:
+                    return dt.strptime(part, fmt)
+                except ValueError:
+                    continue
+
+        return None
 
     def _find_live_photo_pair(self, file_path: Path) -> Optional[Path]:
         """
@@ -173,7 +205,7 @@ class FileProcessor:
             if move_file_safe(file_path, target_path, verify_func, self.dry_run, self.logger):
                 record.status = FileProcessingStatus.SUCCESS.value
                 import datetime
-                record.processed_at = datetime.datetime.now().isoformat()
+                record.processed_at = dt.now().isoformat()
                 self.duplicate_hashes.add(file_hash)
                 self.status_data[file_key] = record
 
@@ -395,7 +427,7 @@ class FileProcessor:
             if move_file_safe(file_path, target_path, verify_func, self.dry_run, self.logger):
                 record.status = FileProcessingStatus.SUCCESS.value
                 import datetime
-                record.processed_at = datetime.datetime.now().isoformat()
+                record.processed_at = dt.now().isoformat()
                 self.duplicate_hashes.add(file_hash)
                 self.status_data[file_key] = record
 
